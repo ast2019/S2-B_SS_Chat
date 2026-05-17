@@ -4,6 +4,8 @@ import logo from './assets/songbird-logo.svg'
 import { APP_CONFIG } from './settings/appConfig.js'
 import InstallBar from './components/pwa/InstallBar.jsx'
 import InstallGuideModal from './components/pwa/InstallGuideModal.jsx'
+import { connectSocket, disconnectSocket } from './lib/socket.js';
+import { initE2E, clearE2EKeys } from './lib/e2e.js';
 
 const API_BASE = ''
 const AUTH_REDIRECT_KEY = 'songbird-auth-redirect'
@@ -763,6 +765,8 @@ export default function App() {
       }
       const nextUser = await resolveSessionUserWithRetry(fallbackUser)
       setUser(nextUser)
+      connectSocket();
+      initE2E().catch(() => {});
       const redirectPath = window.sessionStorage.getItem(AUTH_REDIRECT_KEY)
       if (redirectPath && redirectPath.startsWith('/invite/')) {
         window.sessionStorage.removeItem(AUTH_REDIRECT_KEY)

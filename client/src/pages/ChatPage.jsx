@@ -1,4 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { disconnectSocket } from '../lib/socket.js';
+import { clearE2EKeys } from '../lib/e2e.js';
 import MobileTabMenu from "../components/navigation/MobileTabMenu.jsx";
 import ChatWindowPanel from "../components/chat/ChatWindowPanel.jsx";
 import { ChatSidebar } from "../components/sidebar/index.js";
@@ -5255,6 +5257,8 @@ export default function ChatPage({ user, setUser, isDark, setIsDark, toggleTheme
 
   function handleLogout() {
     logout().catch(() => null);
+    disconnectSocket();
+    clearE2EKeys();
     setUser(null);
     setShowSettings(false);
     setMobileTab("chats");

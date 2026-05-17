@@ -52,3 +52,7 @@ export const emitTypingStop = (chatId) => socket?.emit("typing_stop", { chatId }
 // Read receipts
 export const emitMessageRead = (chatId, messageId) =>
   socket?.emit("message_read", { chatId, messageId });
+
+// NOTE: When handling "new_message" events in React components,
+// skip messages where msg.username === currentUser.username
+// to avoid duplicates (message was already added optimistically on send).
