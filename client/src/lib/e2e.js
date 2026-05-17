@@ -125,41 +125,51 @@ async function deriveSharedKey(privateKeyB64, recipientPubKeyB64) {
 /**
  * Encrypt a plaintext string for a recipient using their public key.
  * Returns "e2e:<ivB64>.<ciphertextB64>"
+ * If recipientPubKeyB64 is null/undefined, returns plaintext unchanged (fallback: unencrypted).
  */
 export async function encryptForUser(text, recipientPubKeyB64) {
+  if (!recipientPubKeyB64) return text;
+
   const stored = getStoredKeys();
   if (!stored?.privateKey) {
-    throw new Error("E2E keys not initialized");
+    return text;
   }
 
-  const sharedKey = await deriveSharedKey(stored.privateKey, recipientPubKeyB64);
+  try {
+    const sharedKey = await deriveSharedKey(stored.privateKey, recipientPubKeyB64);
 
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(text);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encoded = new TextEncoder().encode(text);
 
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    sharedKey,
-    encoded,
-  );
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      sharedKey,
+      encoded,
+    );
 
-  const ivB64 = base64urlEncode(iv);
-  const ciphertextB64 = base64urlEncode(ciphertext);
+    const ivB64 = base64urlEncode(iv);
+    const ciphertextB64 = base64urlEncode(ciphertext);
 
-  return `e2e:${ivB64}.${ciphertextB64}`;
+    return `e2e:${ivB64}.${ciphertextB64}`;
+  } catch (err) {
+    console.warn("[e2e] encrypt failed, sending unencrypted:", err);
+    return text;
+  }
 }
 
 /**
  * Decrypt an E2E message using the sender's public key.
- * Returns plaintext string, or original string on error (graceful fallback).
+ * Returns plaintext string, or a fallback message on error.
  */
 export async function decryptFromUser(cipher, senderPubKeyB64) {
+  if (!isE2EMessage(cipher)) return cipher;
+
+  const stored = getStoredKeys();
+  if (!stored?.privateKey) {
+    return "[Encrypted - open on original device]";
+  }
+
   try {
-    const stored = getStoredKeys();
-    if (!stored?.privateKey) return cipher;
-
-    if (!isE2EMessage(cipher)) return cipher;
-
     const payload = cipher.slice(4); // remove "e2e:" prefix
     const dotIndex = payload.indexOf(".");
     if (dotIndex === -1) return cipher;
@@ -180,8 +190,7 @@ export async function decryptFromUser(cipher, senderPubKeyB64) {
 
     return new TextDecoder().decode(decrypted);
   } catch {
-    // Graceful fallback: return original string unchanged
-    return cipher;
+    return "[Unable to decrypt]";
   }
 }
 

@@ -18,6 +18,12 @@ services:
       VAPID_SUBJECT: ${VAPID_SUBJECT:-}
     volumes:
       - songbird-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "const h=require('http');h.get('http://localhost:${SERVER_PORT:-5174}/api/health',r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>{process.exit(JSON.parse(d).ok?0:1)})}).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   nginx:
     image: nginx:alpine
@@ -31,7 +37,8 @@ services:
       - ./certs/cert.pem:/etc/nginx/certs/cert.pem:ro
       - ./certs/key.pem:/etc/nginx/certs/key.pem:ro
     depends_on:
-      - songbird
+      songbird:
+        condition: service_healthy
 
 volumes:
   songbird-data:

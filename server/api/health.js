@@ -9,7 +9,12 @@ function registerHealthRoutes(app, deps) {
   } = deps;
 
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true });
+    try {
+      deps.adminGetRow?.("SELECT 1 AS ok");
+      res.json({ ok: true, ts: Date.now() });
+    } catch {
+      res.status(503).json({ ok: false, error: "Database unavailable" });
+    }
   });
 
   app.get("/api/events", (req, res) => {
