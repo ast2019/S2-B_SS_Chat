@@ -1,4 +1,5 @@
 import rateLimit from "express-rate-limit";
+import { emitToChat } from "../lib/socket.js";
 
 function registerMessageRoutes(app, deps) {
   const {
@@ -1125,6 +1126,16 @@ function registerMessageRoutes(app, deps) {
         username: user.username,
         body,
         replyToMessageId,
+      });
+
+      // Socket.IO real-time push
+      emitToChat(Number(chatId), "new_message", {
+        id: Number(id),
+        chatId: Number(chatId),
+        username: user.username,
+        body,
+        replyToMessageId,
+        createdAt: new Date().toISOString(),
       });
     }
 
