@@ -2,6 +2,7 @@ import express from "express";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
+import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
@@ -13,6 +14,7 @@ import webpush from "web-push";
 import { registerApiRoutes } from "./api/index.js";
 import { ensureValidVapidKeys } from "./lib/vapid.js";
 import { createSseHub } from "./lib/sse.js";
+import { initSocket } from "./lib/socket.js";
 import { createPushService } from "./lib/push.js";
 import { createUploadTools } from "./lib/uploads.js";
 import { createVideoTranscodeManager } from "./lib/videoTranscode.js";
@@ -938,6 +940,9 @@ backfillStorageEncryption();
 startAutoBackup(dbPath, path.join(dataDir, "backups"), 6);
 remoteChannelManager.start();
 
-app.listen(port, () => {
+const httpServer = createServer(app);
+initSocket(httpServer);
+
+httpServer.listen(port, () => {
   console.log(`Songbird server running on http://localhost:${port}`);
 });

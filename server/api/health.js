@@ -13,6 +13,9 @@ function registerHealthRoutes(app, deps) {
   });
 
   app.get("/api/events", (req, res) => {
+    // DEPRECATED: replaced by Socket.IO (server/lib/socket.js)
+    // Safe to remove after confirming all clients migrated
+    // Keep for now as fallback
     const session = requireSession(req, res);
     if (!session) return;
 
