@@ -1030,7 +1030,7 @@ function registerMessageRoutes(app, deps) {
     const session = requireSession(req, res);
     if (!session) return;
 
-    const { chatId, username, body, replyToMessageId } = req.body || {};
+    const { chatId, username, body, replyToMessageId, e2eEncrypted } = req.body || {};
     const clientRequestIdRaw = String(req.body?.clientRequestId || "").trim();
     const clientRequestId = clientRequestIdRaw
       ? clientRequestIdRaw.slice(0, 120)
@@ -1100,6 +1100,12 @@ function registerMessageRoutes(app, deps) {
     if (!id) {
       return res.status(500).json({ error: "Unable to create message." });
     }
+
+    // Mark as E2E encrypted if flagged by the client
+    if (e2eEncrypted && !created?.deduped) {
+      deps.adminRun("UPDATE chat_messages SET e2e_encrypted = 1 WHERE id = ?", [id]);
+    }
+
     if (chat.type === "saved" && !created?.deduped) {
       markMessageRead(id, user.id);
     }

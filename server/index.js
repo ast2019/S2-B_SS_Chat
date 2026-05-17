@@ -20,6 +20,7 @@ import { createMessageFileJobs } from "./lib/messageFileJobs.js";
 import { createInspector } from "./lib/inspect.js";
 import { createSessionHelpers } from "./lib/sessions.js";
 import { storageEncryption } from "./lib/storageEncryption.js";
+import { startAutoBackup } from "./lib/autoBackup.js";
 import { createRemoteChannelManager } from "./lib/remoteChannels.js";
 import { buildTimestampSchedule } from "./lib/timeUtils.js";
 import { isLoopbackRequest, parseUploadFileMetadata } from "./lib/requestUtils.js";
@@ -85,6 +86,7 @@ import {
   updateUserPassword,
   updateUserProfile,
   updateUserStatus,
+  updateUserPublicKey,
   updateGroupChat,
   updateChannelChat,
   unhideChat,
@@ -110,6 +112,7 @@ import {
   updateRemoteChannelSourceError,
   updateRemoteChannelSourceSeen,
   upsertRemoteChannelSource,
+  dbPath,
 } from "./db.js";
 
 process.title = "songbird-server";
@@ -660,6 +663,7 @@ const apiDeps = {
   updateUserPassword,
   updateUserProfile,
   updateUserStatus,
+  updateUserPublicKey,
   uploadAvatar,
   uploadFiles,
   uploadRootDir,
@@ -931,6 +935,7 @@ if (MESSAGE_TEXT_RETENTION_DAYS > 0) {
 }
 
 backfillStorageEncryption();
+startAutoBackup(dbPath, path.join(dataDir, "backups"), 6);
 remoteChannelManager.start();
 
 app.listen(port, () => {
