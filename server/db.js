@@ -3,7 +3,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
-import initSqlJs from "sql.js";
+import Database from "better-sqlite3";
 import { migrations } from "./migrations/index.js";
 import { setUserColor } from "./settings/colors.js";
 import {
@@ -32,29 +32,20 @@ if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
 
-const SQL = await initSqlJs({
-  locateFile: (file) =>
-    path.resolve(serverDir, "node_modules", "sql.js", "dist", file),
-});
-
-const fileExists = fs.existsSync(dbPath);
-const fileBuffer = fileExists ? fs.readFileSync(dbPath) : null;
-const db = fileBuffer ? new SQL.Database(fileBuffer) : new SQL.Database();
-const DB_SAVE_DEBOUNCE_MS = Math.max(
-  0,
-  Number(process.env.DB_SAVE_DEBOUNCE_MS || 150),
-);
-let pendingSaveTimer = null;
-let databaseDirty = false;
-
-function writeDatabaseToDisk() {
-  const data = db.export();
-  fs.writeFileSync(dbPath, Buffer.from(data));
-  databaseDirty = false;
+// Log warning if STORAGE_ENCRYPTION_KEY is not set
+if (!process.env.STORAGE_ENCRYPTION_KEY) {
+  console.warn("[security] WARNING: STORAGE_ENCRYPTION_KEY is not set. Messages stored unencrypted.");
 }
 
+const db = new Database(dbPath);
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+db.pragma("synchronous = NORMAL");
+db.pragma("cache_size = -32000");
+db.pragma("temp_store = MEMORY");
+
 function createPreMigrationBackup(fromVersion, toVersion) {
-  if (!fileExists || !fs.existsSync(dbPath)) return null;
+  if (!fs.existsSync(dbPath)) return null;
 
   try {
     if (!fs.existsSync(backupDir)) {
@@ -77,79 +68,21 @@ function createPreMigrationBackup(fromVersion, toVersion) {
   }
 }
 
-function saveDatabase() {
-  if (pendingSaveTimer) {
-    clearTimeout(pendingSaveTimer);
-    pendingSaveTimer = null;
-  }
-  if (!databaseDirty && fileExists) return;
-  writeDatabaseToDisk();
-}
-
-function scheduleDatabaseSave() {
-  databaseDirty = true;
-  if (pendingSaveTimer) return;
-  if (DB_SAVE_DEBOUNCE_MS <= 0) {
-    saveDatabase();
-    return;
-  }
-  pendingSaveTimer = setTimeout(() => {
-    pendingSaveTimer = null;
-    if (!databaseDirty) return;
-    writeDatabaseToDisk();
-  }, DB_SAVE_DEBOUNCE_MS);
-  if (typeof pendingSaveTimer?.unref === "function") {
-    pendingSaveTimer.unref();
-  }
-}
-
 function getRow(sql, params = []) {
-  const stmt = db.prepare(sql);
-  stmt.bind(params);
-
-  const row = stmt.step() ? stmt.getAsObject() : null;
-
-  stmt.free();
-
-  return row;
+  return db.prepare(sql).get(...params) || null;
 }
 
 function getAll(sql, params = []) {
-  const stmt = db.prepare(sql);
-  stmt.bind(params);
-
-  const rows = [];
-
-  while (stmt.step()) {
-    rows.push(stmt.getAsObject());
-  }
-
-  stmt.free();
-
-  return rows;
+  return db.prepare(sql).all(...params);
 }
 
 function run(sql, params = []) {
-  const stmt = db.prepare(sql);
-
-  stmt.bind(params);
-  stmt.step();
-  stmt.free();
-
-  const changedRows =
-    typeof db.getRowsModified === "function" ? Number(db.getRowsModified()) : 1;
-  if (changedRows > 0) {
-    scheduleDatabaseSave();
-  }
-  return changedRows;
+  const result = db.prepare(sql).run(...params);
+  return result.changes;
 }
 
 function runWithoutSave(sql, params = []) {
-  const stmt = db.prepare(sql);
-
-  stmt.bind(params);
-  stmt.step();
-  stmt.free();
+  db.prepare(sql).run(...params);
 }
 
 function getLastInsertId() {
@@ -211,12 +144,12 @@ function getSchemaVersion() {
 }
 
 function setSchemaVersion(version) {
-  db.run(`PRAGMA user_version = ${Number(version) || 0}`);
+  db.exec(`PRAGMA user_version = ${Number(version) || 0}`);
 }
 
 function runDatabaseMigrations() {
   const migrationContext = {
-    db,
+    db: { exec: (sql) => db.exec(sql), run: (sql) => db.exec(sql) },
     getAll,
     tableExists,
     hasColumn,
@@ -237,44 +170,26 @@ function runDatabaseMigrations() {
     createPreMigrationBackup(startingVersion, latestVersion);
   }
 
-  let appliedMigration = false;
-
   orderedMigrations.forEach((migration) => {
     if (getSchemaVersion() >= migration.version) return;
 
     migration.up(migrationContext);
     setSchemaVersion(migration.version);
-    appliedMigration = true;
   });
 
   // Self-heal schemas where PRAGMA user_version advanced but tables are missing.
-  // All migrations are written to be idempotent (CREATE IF NOT EXISTS / guarded ALTERs),
-  // so re-applying ensures critical tables exist.
   orderedMigrations.forEach((migration) => {
     migration.up(migrationContext);
   });
 
   if (getSchemaVersion() < latestVersion) {
     setSchemaVersion(latestVersion);
-    appliedMigration = true;
-  }
-
-  if (appliedMigration) {
-    databaseDirty = true;
   }
 }
 
 runDatabaseMigrations();
 
-saveDatabase();
-
-process.once("beforeExit", () => {
-  saveDatabase();
-});
-
-process.once("exit", () => {
-  saveDatabase();
-});
+export { dbPath };
 
 export function getCurrentSchemaVersion() {
   return getSchemaVersion();
@@ -282,17 +197,18 @@ export function getCurrentSchemaVersion() {
 
 export function findUserByUsername(username) {
   return getRow(
-    "SELECT id, username, nickname, avatar_url, color, status, password_hash, banned FROM users WHERE username = ?",
+    "SELECT id, username, nickname, avatar_url, color, status, password_hash, banned, public_key FROM users WHERE username = ?",
     [username],
   );
 }
 
 export function findUserById(id) {
   return getRow(
-    "SELECT id, username, nickname, avatar_url, color, status, password_hash, banned FROM users WHERE id = ?",
+    "SELECT id, username, nickname, avatar_url, color, status, password_hash, banned, public_key FROM users WHERE id = ?",
     [id],
   );
 }
+
 
 export function listUsers(excludeUsername) {
   if (excludeUsername) {
@@ -400,8 +316,8 @@ export function createChat(name, type = "dm", options = {}) {
   run(
     "INSERT INTO chats (name, type, group_username, group_visibility, invite_token, created_by_user_id, group_color, allow_member_invites, group_avatar_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     [
-    normalizedName,
-    normalizedType,
+      normalizedName,
+      normalizedType,
       groupUsername,
       groupVisibility,
       inviteToken,
@@ -620,7 +536,6 @@ export function upsertRemoteChannelSource(payload = {}) {
       ],
     );
   }
-  saveDatabase();
 
   return getRemoteChannelSourceByChatId(chatId);
 }
@@ -637,6 +552,7 @@ export function listEnabledRemoteChannelSources(provider = "telegram") {
     [String(provider || "telegram")],
   );
 }
+
 
 export function updateRemoteChannelSourceSeen(sourceId, payload = {}) {
   const id = Number(sourceId || 0);
@@ -980,6 +896,7 @@ export function markRemoteChannelQueueItemRetry(id, payload = {}) {
   );
 }
 
+
 export function removeChatMember(chatId, userId) {
   run("DELETE FROM chat_members WHERE chat_id = ? AND user_id = ?", [
     Number(chatId),
@@ -1203,9 +1120,7 @@ export function deleteChatById(chatId) {
     .map((row) => String(row?.stored_name || "").trim())
     .filter(Boolean);
 
-  const savepoint = `sp_delete_chat_${targetChatId}_${Date.now()}`;
-  runWithoutSave(`SAVEPOINT ${savepoint}`);
-  try {
+  const deleteChatTransaction = db.transaction(() => {
     runWithoutSave(
       `DELETE FROM chat_message_reads
        WHERE message_id IN (SELECT id FROM chat_messages WHERE chat_id = ?)`,
@@ -1238,17 +1153,9 @@ export function deleteChatById(chatId) {
       targetChatId,
     ]);
     runWithoutSave("DELETE FROM chats WHERE id = ?", [targetChatId]);
-    runWithoutSave(`RELEASE ${savepoint}`);
-    saveDatabase();
-  } catch (error) {
-    try {
-      runWithoutSave(`ROLLBACK TO ${savepoint}`);
-      runWithoutSave(`RELEASE ${savepoint}`);
-    } catch {
-      // ignore rollback failures
-    }
-    throw error;
-  }
+  });
+
+  deleteChatTransaction();
 
   return { storedNames };
 }
@@ -1313,9 +1220,7 @@ export function deleteUserById(userId) {
     });
   }
 
-  const savepoint = `sp_delete_user_${targetUserId}_${Date.now()}`;
-  runWithoutSave(`SAVEPOINT ${savepoint}`);
-  try {
+  const deleteUserTransaction = db.transaction(() => {
     if (uniqueChatDeletes.length) {
       uniqueChatDeletes.forEach((chatId) => {
         runWithoutSave(
@@ -1367,17 +1272,9 @@ export function deleteUserById(userId) {
     runWithoutSave("DELETE FROM chat_left_members WHERE user_id = ?", [targetUserId]);
     runWithoutSave("DELETE FROM chat_members WHERE user_id = ?", [targetUserId]);
     runWithoutSave("DELETE FROM users WHERE id = ?", [targetUserId]);
-    runWithoutSave(`RELEASE ${savepoint}`);
-    saveDatabase();
-  } catch (error) {
-    try {
-      runWithoutSave(`ROLLBACK TO ${savepoint}`);
-      runWithoutSave(`RELEASE ${savepoint}`);
-    } catch {
-      // ignore rollback failures
-    }
-    throw error;
-  }
+  });
+
+  deleteUserTransaction();
 
   return {
     storedNames: Array.from(storedNames),
@@ -1385,6 +1282,7 @@ export function deleteUserById(userId) {
     transferredChatIds: ownershipTransfers.map((t) => Number(t.chatId || 0)),
   };
 }
+
 
 export function listChatsForUser(userId) {
   return getAll(
@@ -1748,6 +1646,7 @@ export function createMessageFiles(messageId, files = []) {
   });
 }
 
+
 export function getMessages(chatId, options = {}) {
   const limitRaw = Number(options.limit || 50);
   const limit = Number.isFinite(limitRaw)
@@ -1821,6 +1720,7 @@ export function getMessages(chatId, options = {}) {
       chat_messages.read_at,
       chat_messages.read_by_user_id,
       chat_messages.reply_to_message_id,
+      chat_messages.e2e_encrypted,
       users.id AS user_id,
       COALESCE(users.username, 'deleted') AS username,
       COALESCE(users.nickname, 'Deleted user') AS nickname,
@@ -2259,5 +2159,12 @@ export function adminRun(sql, params = []) {
 }
 
 export function adminSave() {
-  saveDatabase();
+  // No-op: better-sqlite3 writes synchronously to disk
+}
+
+export function updateUserPublicKey(userId, publicKey) {
+  run("UPDATE users SET public_key = ? WHERE id = ?", [
+    publicKey || null,
+    Number(userId),
+  ]);
 }

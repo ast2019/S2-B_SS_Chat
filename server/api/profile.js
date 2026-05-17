@@ -31,6 +31,7 @@ function registerProfileRoutes(app, deps) {
     updateUserPassword,
     updateUserProfile,
     updateUserStatus,
+    updateUserPublicKey,
     uploadAvatar,
   } = deps;
 
@@ -394,6 +395,43 @@ function registerProfileRoutes(app, deps) {
 
     clearSessionCookie(req, res);
     return res.json({ ok: true });
+  });
+
+  // --- E2E Public Key Endpoints ---
+
+  app.post("/api/user/public-key", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const { publicKey } = req.body || {};
+    if (!publicKey || typeof publicKey !== "string") {
+      return res.status(400).json({ error: "publicKey is required." });
+    }
+
+    const user = findUserById(Number(session.id));
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    updateUserPublicKey(user.id, publicKey.trim());
+    return res.json({ ok: true });
+  });
+
+  app.get("/api/user/:username/public-key", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const username = String(req.params.username || "").trim().toLowerCase();
+    if (!username) {
+      return res.status(400).json({ error: "Username is required." });
+    }
+
+    const user = findUserByUsername(username);
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    return res.json({ publicKey: user.public_key || null });
   });
 }
 
