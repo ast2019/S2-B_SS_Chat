@@ -1,0 +1,438 @@
+function registerProfileRoutes(app, deps) {
+  const {
+    ALLOWED_AVATAR_MIME_TYPES,
+    AVATAR_FILE_LIMITS,
+    createMessage,
+    emitChatEvent,
+    emitSseEvent,
+    FILE_UPLOAD,
+    getUserPresence,
+    listChatMembers,
+    listChatsForUser,
+    USER_COLORS,
+    NICKNAME_MAX,
+    USERNAME_MAX,
+    USERNAME_REGEX,
+    bcrypt,
+    ensureAvatarExists,
+    findChatByGroupUsername,
+    findUserById,
+    findUserByUsername,
+    deleteUserById,
+    hasEnoughFreeDiskSpace,
+    avatarUploadRootDir,
+    clearSessionCookie,
+    removeAvatarByUrl,
+    removeStoredFileNames,
+    removeUploadedFiles,
+    requireSession,
+    requireSessionUsernameMatch,
+    storageEncryption,
+    updateUserPassword,
+    updateUserProfile,
+    updateUserStatus,
+    updateUserPublicKey,
+    uploadAvatar,
+  } = deps;
+
+  const emitPresenceUpdate = (user) => {
+    if (!user?.username) return;
+    const normalizedUsername = String(user.username || "").toLowerCase();
+    const payload = {
+      type: "presence_update",
+      username: normalizedUsername,
+      status: String(user.status || "online").toLowerCase(),
+      lastSeen: user.last_seen || new Date().toISOString(),
+    };
+    const targets = new Set([normalizedUsername]);
+    const chats = listChatsForUser(Number(user.id || 0));
+    chats.forEach((chat) => {
+      const members = listChatMembers(Number(chat?.id || 0));
+      members.forEach((member) => {
+        const memberUsername = String(member?.username || "").toLowerCase();
+        if (memberUsername) targets.add(memberUsername);
+      });
+    });
+    targets.forEach((targetUsername) => {
+      emitSseEvent(targetUsername, payload);
+    });
+  };
+  const emitProfileUpdate = (user, options = {}) => {
+    if (!user?.id) return;
+    const currentUsername = String(user.username || "").toLowerCase();
+    const previousUsername = String(options.previousUsername || "")
+      .trim()
+      .toLowerCase();
+    const payload = {
+      type: "profile_updated",
+      userId: Number(user.id || 0) || null,
+      username: currentUsername,
+      previousUsername: previousUsername || null,
+      nickname: user.nickname || null,
+      avatarUrl: ensureAvatarExists(user.id, user.avatar_url) || null,
+      color: user.color || USER_COLORS[0],
+      status: user.status || "online",
+    };
+    const targets = new Set();
+    if (currentUsername) targets.add(currentUsername);
+    if (previousUsername) targets.add(previousUsername);
+    const chats = listChatsForUser(Number(user.id || 0));
+    chats.forEach((chat) => {
+      const members = listChatMembers(Number(chat?.id || 0));
+      members.forEach((member) => {
+        const memberUsername = String(member?.username || "").toLowerCase();
+        if (memberUsername) targets.add(memberUsername);
+      });
+    });
+    targets.forEach((targetUsername) => {
+      emitSseEvent(targetUsername, payload);
+    });
+  };
+
+  app.get("/api/profile", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const username = req.query.username?.toString();
+    if (!username) {
+      return res.status(400).json({ error: "Username is required." });
+    }
+
+    const user = findUserByUsername(username.toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    res.json({
+      id: user.id,
+      username: user.username,
+      nickname: user.nickname || null,
+      avatarUrl: ensureAvatarExists(user.id, user.avatar_url) || null,
+      color: user.color || USER_COLORS[0],
+      status: user.status || "online",
+    });
+  });
+
+  app.put("/api/profile", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const { currentUsername, username, nickname, avatarUrl } = req.body || {};
+    if (!currentUsername || !username) {
+      return res
+        .status(400)
+        .json({ error: "Current username and new username are required." });
+    }
+
+    const currentUser = findUserByUsername(currentUsername.toLowerCase());
+    if (!currentUser) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    if (!requireSessionUsernameMatch(res, session, currentUsername)) return;
+
+    const trimmed = username.trim().toLowerCase();
+
+    if (trimmed.length < 3) {
+      return res
+        .status(400)
+        .json({ error: "Username must be at least 3 characters." });
+    }
+    if (USERNAME_MAX && trimmed.length > USERNAME_MAX) {
+      return res.status(400).json({
+        error: `Username must be at most ${USERNAME_MAX} characters.`,
+      });
+    }
+
+    if (!USERNAME_REGEX.test(trimmed)) {
+      return res.status(400).json({
+        error:
+          "Username can only include english letters, numbers, dot (.), and underscore (_).",
+      });
+    }
+    if (nickname && String(nickname).trim().length > (NICKNAME_MAX || 0)) {
+      return res.status(400).json({
+        error: `Nickname must be at most ${NICKNAME_MAX} characters.`,
+      });
+    }
+
+    if (trimmed !== currentUser.username) {
+      const existing = findUserByUsername(trimmed);
+      if (existing) {
+        return res.status(409).json({ error: "Username already exists." });
+      }
+      if (findChatByGroupUsername && findChatByGroupUsername(trimmed)) {
+        return res.status(409).json({ error: "Username already exists." });
+      }
+    }
+
+    const nextAvatarUrl = String(avatarUrl || "").trim() || null;
+    const currentAvatarUrl = String(currentUser.avatar_url || "").trim() || null;
+    if (currentAvatarUrl && currentAvatarUrl !== nextAvatarUrl) {
+      removeAvatarByUrl(currentAvatarUrl);
+    }
+
+    updateUserProfile(
+      currentUser.id,
+      trimmed,
+      nickname?.trim() || null,
+      nextAvatarUrl,
+    );
+
+    const updated = findUserById(currentUser.id);
+    emitProfileUpdate(updated, {
+      previousUsername: currentUser.username,
+    });
+
+    res.json({
+      id: updated.id,
+      username: updated.username,
+      nickname: updated.nickname || null,
+      avatarUrl: ensureAvatarExists(updated.id, updated.avatar_url) || null,
+      color: updated.color || USER_COLORS[0],
+      status: updated.status || "online",
+    });
+  });
+
+  app.post("/api/profile/avatar", uploadAvatar.single("avatar"), (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) {
+      removeUploadedFiles(req.file ? [req.file] : [], avatarUploadRootDir);
+      return;
+    }
+
+    const currentUsername = String(req.body?.currentUsername || "")
+      .trim()
+      .toLowerCase();
+    const file = req.file;
+
+    if (!FILE_UPLOAD) {
+      removeUploadedFiles(file ? [file] : [], avatarUploadRootDir);
+      return res
+        .status(503)
+        .json({ error: "File uploads are disabled on this server." });
+    }
+
+    if (!currentUsername) {
+      removeUploadedFiles(file ? [file] : [], avatarUploadRootDir);
+      return res.status(400).json({ error: "Current username is required." });
+    }
+
+    if (!requireSessionUsernameMatch(res, session, currentUsername)) {
+      removeUploadedFiles(file ? [file] : [], avatarUploadRootDir);
+      return;
+    }
+
+    const user = findUserByUsername(currentUsername);
+    if (!user) {
+      removeUploadedFiles(file ? [file] : [], avatarUploadRootDir);
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    if (!file) {
+      return res.status(400).json({ error: "Avatar file is required." });
+    }
+
+    const avatarMime = String(file.mimetype || "").toLowerCase();
+    if (!ALLOWED_AVATAR_MIME_TYPES.has(avatarMime)) {
+      removeUploadedFiles([file], avatarUploadRootDir);
+      return res
+        .status(400)
+        .json({ error: "Avatar must be a JPEG, PNG, GIF, WEBP, or BMP image." });
+    }
+
+    if (!hasEnoughFreeDiskSpace(Number(file.size || 0))) {
+      removeUploadedFiles([file], avatarUploadRootDir);
+
+      return res
+        .status(400)
+        .json({ error: "Not enough free storage space on server." });
+    }
+
+    const avatarUrl = `/api/uploads/avatars/${file.filename}`;
+    try {
+      storageEncryption.encryptFileInPlace(file.path);
+    } catch {
+      removeUploadedFiles([file], avatarUploadRootDir);
+      return res
+        .status(500)
+        .json({ error: "Unable to store avatar securely." });
+    }
+
+    if (String(user.avatar_url || "").trim() && user.avatar_url !== avatarUrl) {
+      removeAvatarByUrl(user.avatar_url);
+    }
+
+    updateUserProfile(
+      user.id,
+      user.username,
+      user.nickname || null,
+      avatarUrl,
+    );
+
+    const updated = findUserById(user.id);
+    emitProfileUpdate(updated, {
+      previousUsername: user.username,
+    });
+
+    return res.json({
+      avatarUrl: ensureAvatarExists(updated.id, updated.avatar_url) || avatarUrl,
+      sizeBytes: Number(file.size || 0),
+      maxFileSizeBytes: AVATAR_FILE_LIMITS.maxFileSizeBytes,
+    });
+  });
+
+  app.put("/api/password", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const { username, currentPassword, newPassword } = req.body || {};
+    if (!username || !currentPassword || !newPassword) {
+      return res.status(400).json({
+        error: "Username, current password, and new password are required.",
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res
+        .status(400)
+        .json({ error: "Password must be at least 6 characters." });
+    }
+
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(username.toLowerCase());
+    if (!user || !bcrypt.compareSync(currentPassword, user.password_hash)) {
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    const passwordHash = bcrypt.hashSync(newPassword, 10);
+    updateUserPassword(user.id, passwordHash);
+
+    res.json({ ok: true });
+  });
+
+  app.put("/api/status", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const { username, status } = req.body || {};
+    if (!username || !status) {
+      return res.status(400).json({ error: "Username and status are required." });
+    }
+
+    const allowed = new Set(["online", "invisible"]);
+    if (!allowed.has(status)) {
+      return res.status(400).json({ error: "Invalid status." });
+    }
+
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(username.toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    updateUserStatus(user.id, status);
+    const refreshedUser = getUserPresence(String(user.username || "").toLowerCase());
+    if (refreshedUser) {
+      emitPresenceUpdate(refreshedUser);
+    }
+
+    res.json({ ok: true, status });
+  });
+
+  app.post("/api/profile/delete", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ error: "Username and password are required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(String(username || "").toLowerCase());
+    if (!user || !bcrypt.compareSync(String(password || ""), user.password_hash)) {
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    if (user.avatar_url) {
+      removeAvatarByUrl(user.avatar_url);
+    }
+
+    const memberChats = listChatsForUser(Number(user.id || 0));
+    memberChats.forEach((chat) => {
+      const chatId = Number(chat?.id || 0);
+      if (!chatId) return;
+      const label = user.nickname || user.username;
+      if (String(chat?.type || "").toLowerCase() === "group") {
+        createMessage(chatId, user.id, `[[system:left:${label}]]`);
+        emitChatEvent(chatId, {
+          type: "chat_message",
+          chatId,
+          username: user.username,
+          body: `[[system:left:${label}]]`,
+        });
+      }
+      const members = listChatMembers(chatId);
+      members.forEach((member) => {
+        const memberUsername = String(member?.username || "").toLowerCase();
+        if (!memberUsername || memberUsername === String(user.username || "").toLowerCase())
+          return;
+        try {
+          emitSseEvent(memberUsername, { type: "chat_list_changed", chatId });
+        } catch {
+          // ignore realtime list errors
+        }
+      });
+    });
+
+    const { storedNames } = deleteUserById(Number(user.id));
+    if (Array.isArray(storedNames) && storedNames.length) {
+      removeStoredFileNames(storedNames);
+    }
+
+    clearSessionCookie(req, res);
+    return res.json({ ok: true });
+  });
+
+  // --- E2E Public Key Endpoints ---
+
+  app.post("/api/user/public-key", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const { publicKey } = req.body || {};
+    if (!publicKey || typeof publicKey !== "string") {
+      return res.status(400).json({ error: "publicKey is required." });
+    }
+
+    const user = findUserById(Number(session.id));
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    updateUserPublicKey(user.id, publicKey.trim());
+    return res.json({ ok: true });
+  });
+
+  app.get("/api/user/:username/public-key", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const username = String(req.params.username || "").trim().toLowerCase();
+    if (!username) {
+      return res.status(400).json({ error: "Username is required." });
+    }
+
+    const user = findUserByUsername(username);
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    return res.json({ publicKey: user.public_key || null });
+  });
+}
+
+export { registerProfileRoutes };

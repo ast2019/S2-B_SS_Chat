@@ -1,0 +1,56 @@
+{
+  "name": "songbird-server",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bllackbull/songbird.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bllackbull/songbird/issues"
+  },
+  "homepage": "https://github.com/bllackbull/songbird#readme",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --watch-path=. --watch-path=../.env index.js",
+    "start": "node index.js",
+    "test": "node -e \"console.log('No server tests configured.');\"",
+    "db:delete": "node scripts/delete-db.js",
+    "db:reset": "node scripts/reset-db.js",
+    "db:backup": "node scripts/backup-db.js",
+    "db:restore": "node scripts/restore-db.js",
+    "db:vacuum": "node scripts/vacuum-db.js",
+    "db:help": "node scripts/db-help.js",
+    "db:migrate": "node scripts/migrate.js",
+    "db:backfill": "node scripts/backfill-message-file-metadata.js",
+    "db:chat:create": "node scripts/create-chat.js",
+    "db:chat:add": "node scripts/add-chat-member.js",
+    "db:chat:edit": "node scripts/edit-chat.js",
+    "db:chat:delete": "node scripts/delete-chat.js",
+    "db:file:delete": "node scripts/delete-file.js",
+    "db:user:edit": "node scripts/edit-user.js",
+    "db:user:ban": "node scripts/ban-user.js",
+    "db:user:delete": "node scripts/delete-user.js",
+    "db:user:create": "node scripts/create-user.js",
+    "db:user:generate": "node scripts/generate-user.js",
+    "db:message:generate": "node scripts/generate-chat-message.js",
+    "db:inspect": "node scripts/inspect-db.js all",
+    "db:chat:inspect": "node scripts/inspect-db.js chat",
+    "db:user:inspect": "node scripts/inspect-db.js user",
+    "db:file:inspect": "node scripts/inspect-db.js file",
+    "remote:configure": "node scripts/configure-remote-channel.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "compression": "^1.8.1",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.2.1",
+    "multer": "^2.1.1",
+    "better-sqlite3": "^11.7.0",
+    "node-cron": "^3.0.3",
+    "socket.io": "^4.8.1",
+    "telegram": "^2.26.22",
+    "web-push": "^3.6.7"
+  }
+}

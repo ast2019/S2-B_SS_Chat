@@ -1,0 +1,1497 @@
+import { createInviteToken } from "../lib/inviteTokens.js";
+import { normalizeTelegramSource } from "../lib/remoteChannels.js";
+
+function registerChatRoutes(app, deps) {
+  const {
+    USERNAME_REGEX,
+    USER_COLORS,
+    addChatMember,
+    ALLOWED_AVATAR_MIME_TYPES,
+    AVATAR_FILE_LIMITS,
+    avatarUploadRootDir,
+    cleanupMissingMessageFiles,
+    clearChatMemberLeft,
+    crypto,
+    createChat,
+    createMessage,
+    deleteChatById,
+    emitChatEvent,
+    emitSseEvent,
+    ensureSavedChatForUser,
+    ensureAvatarExists,
+    findChatById,
+    findChatByGroupUsername,
+    findChatByInviteToken,
+    findDmChat,
+    findUserByUsername,
+    hideChatsForUser,
+    hydrateMissingVideoMetadata,
+    isGroupMemberRemoved,
+    isMember,
+    isVideoFileProcessing,
+    listChatMembers,
+    listChatsForUser,
+    listMessageFilesByMessageIds,
+    listUsers,
+    removeAvatarByUrl,
+    removeStoredFileNames,
+    clearGroupMemberRemoved,
+    bcrypt,
+    markChatMemberLeft,
+    markGroupMemberRemoved,
+    removeChatMember,
+    regenerateGroupInviteToken,
+    removeUploadedFiles,
+    requireSession,
+    requireSessionUsernameMatch,
+    searchUsers,
+    searchPublicGroups,
+    searchPublicChannels,
+    setChatMuted,
+    storageEncryption,
+    updateGroupChat,
+    updateChannelChat,
+    unhideChat,
+    uploadAvatar,
+    setChatMemberRole,
+    FILE_UPLOAD,
+    REMOTE_CHANNELS,
+    remoteChannelManager,
+    upsertRemoteChannelSource,
+  } = deps;
+
+  const resolveClientBaseOrigin = (req) => {
+    const referer = String(req.headers?.referer || "").trim();
+    let refererOrigin = "";
+    if (referer) {
+      try {
+        refererOrigin = new URL(referer).origin;
+      } catch {
+        refererOrigin = "";
+      }
+    }
+
+    const originHeader = String(req.headers?.origin || "").trim();
+    const forwardedProto = String(req.headers?.["x-forwarded-proto"] || "")
+      .split(",")[0]
+      .trim();
+    const forwardedHost = String(req.headers?.["x-forwarded-host"] || "")
+      .split(",")[0]
+      .trim();
+    const fallbackOrigin = `${forwardedProto || req.protocol}://${forwardedHost || req.get("host")}`;
+    const origin = refererOrigin || originHeader || fallbackOrigin;
+    // Remove trailing slashes safely without ReDoS vulnerability
+    return origin.endsWith("/") ? origin.slice(0, -1) : origin;
+  };
+  const normalizeGroupAvatarUrl = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    if (raw.startsWith("/api/uploads/avatars/")) return raw;
+    if (raw.startsWith("/uploads/avatars/")) return `/api${raw}`;
+    return raw;
+  };
+  const normalizeInviteUsername = (value) => {
+    const cleaned = String(value || "")
+      .trim()
+      .replace(/^@+/, "")
+      .toLowerCase();
+    // Limit length to prevent ReDoS attacks
+    return cleaned.slice(0, 100);
+  };
+  const decodeInviteTarget = (value) => {
+    const target = String(value || "").trim();
+    try {
+      return decodeURIComponent(target);
+    } catch {
+      return target;
+    }
+  };
+  const isPublicChat = (chat) =>
+    String(chat?.group_visibility || "public").trim().toLowerCase() ===
+    "public";
+  const isRemoteChannelAvailable = () =>
+    Boolean(REMOTE_CHANNELS?.enabled && REMOTE_CHANNELS?.telegramConfigured);
+  const normalizeCreateRemoteChannel = ({
+    remoteChannel,
+    chatType,
+    visibility,
+  }) => {
+    if (
+      chatType !== "channel" ||
+      !remoteChannel ||
+      typeof remoteChannel !== "object"
+    ) {
+      return { shouldSave: false };
+    }
+
+    const enabled = Boolean(remoteChannel.enabled);
+    const rawSource = String(
+      remoteChannel.source || remoteChannel.sourceRaw || "",
+    ).trim();
+    const syncMetadata = enabled && Boolean(remoteChannel.syncMetadata);
+    const streamMedia = enabled && Boolean(FILE_UPLOAD && remoteChannel.streamMedia);
+    const shouldSave = Boolean(
+      enabled || rawSource || syncMetadata || streamMedia,
+    );
+    if (!shouldSave) return { shouldSave: false };
+
+    if (!isRemoteChannelAvailable()) {
+      return {
+        shouldSave: true,
+        error: "Remote Channel is not configured on this server.",
+        status: 503,
+      };
+    }
+    if (enabled && String(visibility || "").toLowerCase() === "private") {
+      return {
+        shouldSave: true,
+        error: "Remote Channel can only be enabled for public channels.",
+        status: 400,
+      };
+    }
+
+    const provider = String(remoteChannel.provider || "telegram").toLowerCase();
+    if (provider !== "telegram") {
+      return {
+        shouldSave: true,
+        error: "Remote Channel source is invalid.",
+        status: 400,
+      };
+    }
+
+    let normalized = {
+      ok: true,
+      sourceRaw: rawSource,
+      sourceChatId: "",
+      sourceUsername: "",
+    };
+    if (enabled) {
+      normalized = normalizeTelegramSource(rawSource);
+      if (!normalized.ok) {
+        return {
+          shouldSave: true,
+          error: normalized.error,
+          status: 400,
+        };
+      }
+    } else if (rawSource) {
+      const optionalNormalized = normalizeTelegramSource(rawSource);
+      if (optionalNormalized.ok) normalized = optionalNormalized;
+    }
+
+    if (enabled && !normalized.sourceChatId && !normalized.sourceUsername) {
+      return {
+        shouldSave: true,
+        error: "Telegram source is required.",
+        status: 400,
+      };
+    }
+
+    return {
+      shouldSave: true,
+      enabled,
+      provider,
+      sourceRaw: normalized.sourceRaw,
+      sourceChatId: normalized.sourceChatId,
+      sourceUsername: normalized.sourceUsername,
+      syncMetadata,
+      streamMedia,
+    };
+  };
+  const buildGroupInviteLink = (baseOrigin, chat, inviteToken) => {
+    const username = normalizeInviteUsername(chat?.group_username);
+    if (isPublicChat(chat) && username) {
+      return `${baseOrigin}/invite/${encodeURIComponent(username)}`;
+    }
+    const token = String(inviteToken ?? chat?.invite_token ?? "").trim();
+    return token ? `${baseOrigin}/invite/${encodeURIComponent(token)}` : "";
+  };
+  const findPublicChatByInviteUsername = (value) => {
+    const username = normalizeInviteUsername(value);
+    if (!username) return null;
+    const chat = findChatByGroupUsername(username);
+    if (!chat || !isPublicChat(chat)) return null;
+    return chat;
+  };
+  const findChatByInviteTarget = (value) => {
+    const target = decodeInviteTarget(value);
+    if (!target) return null;
+    if (target.startsWith("@")) return findPublicChatByInviteUsername(target);
+    return findChatByInviteToken(target) || findPublicChatByInviteUsername(target);
+  };
+  const emitChatListChangedToChatParticipants = (chatId, extraUsernames = []) => {
+    const memberUsernames = listChatMembers(Number(chatId))
+      .map((member) => String(member?.username || "").toLowerCase())
+      .filter(Boolean);
+    const targets = new Set([
+      ...memberUsernames,
+      ...(Array.isArray(extraUsernames) ? extraUsernames : [])
+        .map((value) => String(value || "").toLowerCase())
+        .filter(Boolean),
+    ]);
+    targets.forEach((targetUsername) => {
+      try {
+        emitSseEvent(targetUsername, { type: "chat_list_changed", chatId });
+      } catch {
+        // ignore realtime list errors
+      }
+    });
+  };
+
+  app.get("/api/chats", async (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const username = req.query.username?.toString();
+    if (!username) {
+      return res.status(400).json({ error: "Username is required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(username.toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    let chats = listChatsForUser(user.id).map((conv) => {
+      const members = listChatMembers(conv.id).map((member) => ({
+        ...member,
+        avatar_url: ensureAvatarExists(member.id, member.avatar_url),
+      }));
+
+      return { ...conv, members };
+    });
+
+    const initialLastMessageIds = chats
+      .map((chat) => Number(chat.last_message_id || 0))
+      .filter(Boolean);
+    const cleanup = cleanupMissingMessageFiles(initialLastMessageIds);
+
+    if (cleanup.changed) {
+      if (cleanup.deletedByChat && cleanup.deletedByChat.size) {
+        cleanup.deletedByChat.forEach((messageIds, chatId) => {
+          emitChatEvent(Number(chatId), {
+            type: "chat_message_deleted",
+            chatId: Number(chatId),
+            messageIds,
+          });
+        });
+      }
+      chats = listChatsForUser(user.id).map((conv) => {
+        const members = listChatMembers(conv.id).map((member) => ({
+          ...member,
+          avatar_url: ensureAvatarExists(member.id, member.avatar_url),
+        }));
+
+        return { ...conv, members };
+      });
+    }
+
+    const lastMessageIds = chats
+      .map((chat) => Number(chat.last_message_id || 0))
+      .filter(Boolean);
+    const lastFiles = await hydrateMissingVideoMetadata(
+      listMessageFilesByMessageIds(lastMessageIds),
+    );
+
+    const filesByMessageId = lastFiles.reduce((acc, file) => {
+      const messageId = Number(file.message_id);
+
+      if (!acc[messageId]) acc[messageId] = [];
+
+      acc[messageId].push({
+        id: Number(file.id),
+        kind: file.kind,
+        name: file.original_name,
+        mimeType: file.mime_type,
+        processing: isVideoFileProcessing(file),
+        sizeBytes: Number(file.size_bytes || 0),
+        width: Number.isFinite(Number(file.width_px))
+          ? Number(file.width_px)
+          : null,
+        height: Number.isFinite(Number(file.height_px))
+          ? Number(file.height_px)
+          : null,
+        durationSeconds: Number.isFinite(Number(file.duration_seconds))
+          ? Number(file.duration_seconds)
+          : null,
+        expiresAt: file.expires_at || null,
+        url: `/api/uploads/messages/${file.stored_name}`,
+      });
+
+      return acc;
+    }, {});
+
+    const enrichedChats = chats.map((chat) => ({
+      ...chat,
+      last_message_files:
+        filesByMessageId[Number(chat.last_message_id || 0)] || [],
+    }));
+
+    res.json({ chats: enrichedChats });
+  });
+
+  app.get("/api/chats/saved", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const username = req.query.username?.toString();
+    if (!username) {
+      return res.status(400).json({ error: "Username is required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(String(username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const savedChat = ensureSavedChatForUser(Number(user.id));
+    if (!savedChat?.id) {
+      return res.status(500).json({ error: "Unable to open saved messages." });
+    }
+    unhideChat(user.id, Number(savedChat.id));
+
+    return res.json({ id: Number(savedChat.id) });
+  });
+
+  app.post("/api/chats/dm", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const { from, to } = req.body || {};
+    if (!from || !to) {
+      return res.status(400).json({ error: "Both users are required." });
+    }
+
+    if (!requireSessionUsernameMatch(res, session, from)) return;
+
+    const fromUser = findUserByUsername(from.toLowerCase());
+    const toUser = findUserByUsername(to.toLowerCase());
+    if (!fromUser || !toUser) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const existingId = findDmChat(fromUser.id, toUser.id);
+    if (existingId) {
+      // Unhide the chat for both users (in case it was previously deleted)
+      unhideChat(fromUser.id, existingId);
+      unhideChat(toUser.id, existingId);
+
+      return res.json({ id: existingId });
+    }
+
+    const chatId = createChat(null, "dm");
+    if (!chatId) {
+      return res.status(500).json({ error: "Failed to create chat." });
+    }
+
+    addChatMember(chatId, fromUser.id, "owner");
+    addChatMember(chatId, toUser.id, "member");
+
+    res.json({ id: chatId });
+  });
+
+  app.post("/api/chats", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const { name, type, members = [], creator } = req.body || {};
+    if (!creator) {
+      return res.status(400).json({ error: "Creator is required." });
+    }
+
+    if (!requireSessionUsernameMatch(res, session, creator)) return;
+
+    const creatorUser = findUserByUsername(creator.toLowerCase());
+    if (!creatorUser) {
+      return res.status(404).json({ error: "Creator not found." });
+    }
+
+    const normalizedType = type === "channel" ? "channel" : "group";
+    const chatId = createChat(name || "Untitled", normalizedType);
+
+    addChatMember(chatId, creatorUser.id, "owner");
+
+    const memberSet = new Set(
+      members.map((value) => value.toString().toLowerCase()),
+    );
+    memberSet.delete(creatorUser.username);
+
+    memberSet.forEach((username) => {
+      const member = findUserByUsername(username);
+      if (member) {
+        addChatMember(chatId, member.id, "member");
+      }
+    });
+
+    res.json({ id: chatId });
+  });
+
+  app.post("/api/chats/group", async (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const {
+      type,
+      creator,
+      nickname,
+      username,
+      visibility,
+      allowMemberInvites = true,
+      groupColor,
+      color,
+      members = [],
+      remoteChannel = null,
+    } = req.body || {};
+
+    if (!creator) {
+      return res.status(400).json({ error: "Creator is required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, creator)) return;
+
+    const creatorUser = findUserByUsername(String(creator).toLowerCase());
+    if (!creatorUser) {
+      return res.status(404).json({ error: "Creator not found." });
+    }
+
+    const normalizedType =
+      String(type || "group").toLowerCase() === "channel" ? "channel" : "group";
+    const label = normalizedType === "channel" ? "Channel" : "Group";
+    const groupNickname = String(nickname || "").trim();
+    const groupUsername = String(username || "")
+      .trim()
+      .toLowerCase();
+    if (!groupNickname) {
+      return res.status(400).json({ error: `${label} nickname is required.` });
+    }
+    if (!groupUsername) {
+      return res.status(400).json({ error: `${label} username is required.` });
+    }
+    if (groupUsername.length < 3) {
+      return res
+        .status(400)
+        .json({ error: `${label} username must be at least 3 characters.` });
+    }
+    if (!USERNAME_REGEX.test(groupUsername)) {
+      return res.status(400).json({
+        error:
+          `${label} username can only include english letters, numbers, dot (.), and underscore (_).`,
+      });
+    }
+
+    if (findUserByUsername(groupUsername)) {
+      return res.status(409).json({ error: `${label} username already exists.` });
+    }
+
+    if (findChatByGroupUsername(groupUsername)) {
+      return res.status(409).json({ error: `${label} username already exists.` });
+    }
+
+    const normalizedVisibility =
+      String(visibility || "").toLowerCase() === "private"
+        ? "private"
+        : "public";
+    const remoteChannelConfig = normalizeCreateRemoteChannel({
+      remoteChannel,
+      chatType: normalizedType,
+      visibility: normalizedVisibility,
+    });
+    if (remoteChannelConfig.error) {
+      return res
+        .status(remoteChannelConfig.status || 400)
+        .json({ error: remoteChannelConfig.error });
+    }
+    const suppliedGroupColor = String(groupColor || color || "")
+      .trim()
+      .toLowerCase();
+    const normalizedGroupColor = Array.isArray(USER_COLORS) &&
+      USER_COLORS.includes(suppliedGroupColor)
+      ? suppliedGroupColor
+      : "";
+    const inviteToken = createInviteToken(crypto);
+    const chatId = createChat(groupNickname, normalizedType, {
+      groupUsername,
+      groupVisibility: normalizedVisibility,
+      inviteToken,
+      createdByUserId: creatorUser.id,
+      groupColor: normalizedGroupColor,
+      allowMemberInvites: Boolean(allowMemberInvites),
+    });
+
+    if (!chatId) {
+      return res.status(500).json({ error: `Failed to create ${label.toLowerCase()}.` });
+    }
+
+    addChatMember(chatId, creatorUser.id, "owner");
+    const memberSet = new Set(
+      (Array.isArray(members) ? members : [])
+        .map((value) => String(value || "").toLowerCase())
+        .filter(Boolean),
+    );
+    memberSet.delete(String(creatorUser.username || "").toLowerCase());
+    memberSet.forEach((memberUsername) => {
+      const member = findUserByUsername(memberUsername);
+      if (member) addChatMember(chatId, member.id, "member");
+    });
+
+    if (remoteChannelConfig.shouldSave) {
+      let remoteSource = null;
+      try {
+        remoteSource = upsertRemoteChannelSource({
+          chatId,
+          provider: remoteChannelConfig.provider,
+          sourceRaw: remoteChannelConfig.sourceRaw,
+          sourceChatId: remoteChannelConfig.sourceChatId,
+          sourceUsername: remoteChannelConfig.sourceUsername,
+          syncMetadata: remoteChannelConfig.syncMetadata,
+          streamMedia: remoteChannelConfig.streamMedia,
+          enabled: remoteChannelConfig.enabled,
+        });
+        if (
+          remoteChannelConfig.enabled &&
+          remoteChannelConfig.syncMetadata &&
+          typeof remoteChannelManager?.syncSourceMetadata === "function"
+        ) {
+          await remoteChannelManager.syncSourceMetadata(remoteSource.id);
+        }
+      } catch (error) {
+        deleteChatById(chatId);
+        return res.status(400).json({
+          error: remoteChannelConfig.syncMetadata
+            ? `Unable to sync Telegram metadata: ${
+                error?.message || "Unknown error"
+              }`
+            : error?.message || "Unable to configure Remote Channel.",
+        });
+      }
+    }
+
+    emitChatListChangedToChatParticipants(chatId);
+
+    const createdChat = findChatById(chatId);
+    const baseOrigin = resolveClientBaseOrigin(req);
+    const inviteLink = buildGroupInviteLink(baseOrigin, createdChat, inviteToken);
+    return res.json({
+      id: Number(chatId),
+      inviteToken,
+      inviteLink,
+      color: createdChat?.group_color || normalizedGroupColor || "#10b981",
+      visibility: normalizedVisibility,
+    });
+  });
+
+  app.get("/api/groups/invite/:token", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const target = String(req.params?.token || "").trim();
+    if (!target) {
+      return res.status(400).json({ error: "Invite link is required." });
+    }
+
+    const chat = findChatByInviteTarget(target);
+    if (!chat) {
+      return res.status(404).json({ error: "Invite link is invalid." });
+    }
+
+    const user = findUserByUsername(String(session.username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const members = listChatMembers(Number(chat.id)).map((member) => ({
+      ...member,
+      avatar_url: ensureAvatarExists(member.id, member.avatar_url),
+    }));
+    const label = chat.type === "channel" ? "Channel" : "Group";
+
+    return res.json({
+      group: {
+        id: Number(chat.id),
+        name: chat.name || label,
+        type: chat.type || "group",
+        username: chat.group_username || "",
+        color: chat.group_color || "#10b981",
+        avatarUrl: normalizeGroupAvatarUrl(chat.group_avatar_url),
+        visibility: chat.group_visibility || "public",
+        allowMemberInvites: Boolean(Number(chat.allow_member_invites || 0)),
+        membersCount: members.length,
+      },
+      alreadyMember: isMember(Number(chat.id), Number(user.id)),
+    });
+  });
+
+  app.post("/api/groups/invite/:token/join", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const target = String(req.params?.token || "").trim();
+    const suppliedUsername = req.body?.username?.toString();
+    if (suppliedUsername && !requireSessionUsernameMatch(res, session, suppliedUsername)) {
+      return;
+    }
+    if (!target) {
+      return res.status(400).json({ error: "Invite link is required." });
+    }
+
+    const chat = findChatByInviteTarget(target);
+    if (!chat) {
+      return res.status(404).json({ error: "Invite link is invalid." });
+    }
+
+    const user = findUserByUsername(String(session.username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const chatId = Number(chat.id);
+    // Re-show chats that were previously hidden from this user's list.
+    unhideChat(user.id, chatId);
+    if (isGroupMemberRemoved(chatId, user.id)) {
+      return res.status(403).json({
+        error: "You were removed from this group. Only the owner can re-add you.",
+      });
+    }
+    const wasMember = isMember(chatId, user.id);
+    if (!wasMember) {
+      clearChatMemberLeft(chatId, user.id);
+      addChatMember(chatId, user.id, "member");
+      if (chat.type === "group") {
+        createMessage(chatId, user.id, `[[system:joined:${user.nickname || user.username}]]`);
+        try {
+          emitChatEvent(chatId, {
+            type: "chat_message",
+            chatId,
+            username: user.username,
+            body: `[[system:joined:${user.nickname || user.username}]]`,
+          });
+        } catch {
+          // Joining should not fail due to transient event broadcast issues.
+        }
+      }
+    }
+    unhideChat(user.id, chatId);
+    emitChatListChangedToChatParticipants(chatId);
+
+    return res.json({
+      ok: true,
+      id: chatId,
+      alreadyMember: wasMember,
+    });
+  });
+
+  app.get("/api/chats/:chatId/preview", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const chatId = Number(req.params?.chatId || 0);
+    const username = String(req.query.username || "").trim();
+    if (!chatId || !username) {
+      return res.status(400).json({ error: "Chat id and username are required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(username.toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const chat = findChatById(chatId);
+    if (!chat || !["group", "channel"].includes(String(chat.type || "").toLowerCase())) {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+
+    const isMemberFlag = isMember(chatId, user.id);
+    const visibility = String(chat.group_visibility || "public").trim().toLowerCase();
+    if (!isMemberFlag && visibility !== "public") {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+
+    return res.json({
+      id: Number(chat.id),
+      type: chat.type === "channel" ? "channel" : "group",
+      name: chat.name || (chat.type === "channel" ? "Channel" : "Group"),
+      username: chat.group_username || "",
+      visibility: chat.group_visibility || "public",
+      color: chat.group_color || "#10b981",
+      avatarUrl: normalizeGroupAvatarUrl(chat.group_avatar_url),
+      inviteToken: chat.invite_token || "",
+      membersCount: listChatMembers(chatId).length,
+      isMember: Boolean(isMemberFlag),
+    });
+  });
+
+  app.get("/api/chats/group/:chatId/invite-link", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const chatId = Number(req.params?.chatId || 0);
+    if (!chatId) {
+      return res.status(400).json({ error: "Chat id is required." });
+    }
+
+    const chat = findChatById(chatId);
+    if (!chat || (chat.type !== "group" && chat.type !== "channel")) {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+
+    const user = findUserByUsername(String(session.username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+    if (!isMember(chatId, user.id)) {
+      return res.status(403).json({ error: "Not a member of this group." });
+    }
+
+    const members = listChatMembers(chatId);
+    const label = chat.type === "channel" ? "channel" : "group";
+    const isOwner = members.some(
+      (member) =>
+        Number(member.id) === Number(user.id) &&
+        String(member.role || "").toLowerCase() === "owner",
+    );
+    const allowMemberInvites = Boolean(Number(chat.allow_member_invites || 0));
+    if (!isOwner && !allowMemberInvites) {
+      return res
+        .status(403)
+        .json({ error: `Only ${label} owner can share invite link.` });
+    }
+
+    const baseOrigin = resolveClientBaseOrigin(req);
+
+    return res.json({
+      inviteToken: chat.invite_token || "",
+      inviteLink: buildGroupInviteLink(baseOrigin, chat),
+      allowMemberInvites,
+      isOwner,
+    });
+  });
+
+  app.post("/api/chats/group/:chatId/regenerate-invite", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const chatId = Number(req.params?.chatId || 0);
+    const username = req.body?.username?.toString();
+    if (!chatId || !username) {
+      return res.status(400).json({ error: "Chat id and username are required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(String(username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+    const chat = findChatById(chatId);
+    if (!chat || (chat.type !== "group" && chat.type !== "channel")) {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+    const members = listChatMembers(chatId);
+    const label = chat.type === "channel" ? "channel" : "group";
+    const isOwner = members.some(
+      (member) =>
+        Number(member.id) === Number(user.id) &&
+        String(member.role || "").toLowerCase() === "owner",
+    );
+    if (!isOwner) {
+      return res
+        .status(403)
+        .json({ error: `Only ${label} owner can regenerate invite link.` });
+    }
+
+    const inviteToken = createInviteToken(crypto);
+    regenerateGroupInviteToken(chatId, inviteToken);
+    const baseOrigin = resolveClientBaseOrigin(req);
+    return res.json({
+      ok: true,
+      inviteToken,
+      inviteLink: buildGroupInviteLink(baseOrigin, chat, inviteToken),
+    });
+  });
+
+  app.put("/api/chats/group/:chatId", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const chatId = Number(req.params?.chatId || 0);
+    if (!chatId) {
+      return res.status(400).json({ error: "Group chat id is required." });
+    }
+
+    const {
+      username,
+      nickname,
+      groupUsername,
+      visibility,
+      allowMemberInvites = true,
+      members: memberUsernames = [],
+    } = req.body || {};
+    if (!username) {
+      return res.status(400).json({ error: "Username is required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(String(username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const chat = findChatById(chatId);
+    if (!chat || (chat.type !== "group" && chat.type !== "channel")) {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+
+    const chatMembers = listChatMembers(chatId);
+    const label = chat.type === "channel" ? "Channel" : "Group";
+    const isOwner = chatMembers.some(
+      (member) =>
+        Number(member.id) === Number(user.id) &&
+        String(member.role || "").toLowerCase() === "owner",
+    );
+    if (!isOwner) {
+      return res
+        .status(403)
+        .json({ error: `Only ${label.toLowerCase()} owner can edit this ${label.toLowerCase()}.` });
+    }
+
+    const normalizedNickname = String(nickname || "").trim();
+    const normalizedGroupUsername = String(groupUsername || "")
+      .trim()
+      .toLowerCase();
+    if (!normalizedNickname) {
+      return res.status(400).json({ error: `${label} nickname is required.` });
+    }
+    if (normalizedGroupUsername.length < 3) {
+      return res
+        .status(400)
+        .json({ error: `${label} username must be at least 3 characters.` });
+    }
+    if (!USERNAME_REGEX.test(normalizedGroupUsername)) {
+      return res.status(400).json({
+        error:
+          `${label} username can only include english letters, numbers, dot (.), and underscore (_).`,
+      });
+    }
+
+    if (findUserByUsername(normalizedGroupUsername)) {
+      return res.status(409).json({ error: `${label} username already exists.` });
+    }
+
+    const existing = findChatByGroupUsername(normalizedGroupUsername);
+    if (existing && Number(existing.id) !== chatId) {
+      return res.status(409).json({ error: `${label} username already exists.` });
+    }
+
+    const updateFn = chat.type === "channel" ? updateChannelChat : updateGroupChat;
+    updateFn(chatId, {
+      name: normalizedNickname,
+      groupUsername: normalizedGroupUsername,
+      groupVisibility: visibility,
+      allowMemberInvites: Boolean(allowMemberInvites),
+    });
+
+    const nextMembers = new Set(
+      (Array.isArray(memberUsernames) ? memberUsernames : [])
+        .map((item) => String(item || "").toLowerCase())
+        .filter(Boolean),
+    );
+    nextMembers.delete(String(user.username || "").toLowerCase());
+    nextMembers.forEach((memberUsername) => {
+      const member = findUserByUsername(memberUsername);
+      if (!member) return;
+      if (isMember(chatId, member.id)) {
+        unhideChat(member.id, chatId);
+        return;
+      }
+      clearChatMemberLeft(chatId, member.id);
+      clearGroupMemberRemoved(chatId, member.id);
+      unhideChat(member.id, chatId);
+      addChatMember(chatId, member.id, "member");
+      if (chat.type === "group") {
+        createMessage(
+          chatId,
+          user.id,
+          `[[system:joined:${member.nickname || member.username}]]`,
+        );
+        emitChatEvent(chatId, {
+          type: "chat_message",
+          chatId,
+          username: user.username,
+          body: `[[system:joined:${member.nickname || member.username}]]`,
+        });
+      }
+      try {
+        emitSseEvent(member.username, { type: "chat_list_changed", chatId });
+      } catch {
+        // ignore realtime list errors
+      }
+    });
+
+    const updated = findChatById(chatId);
+    const baseOrigin = resolveClientBaseOrigin(req);
+    emitChatListChangedToChatParticipants(chatId);
+    return res.json({
+      ok: true,
+      group: updated,
+      inviteToken: updated?.invite_token || "",
+      inviteLink: buildGroupInviteLink(baseOrigin, updated),
+    });
+  });
+
+  app.post("/api/chats/group/:chatId/leave", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const chatId = Number(req.params?.chatId || 0);
+    const username = req.body?.username?.toString();
+    if (!chatId || !username) {
+      return res.status(400).json({ error: "Chat id and username are required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(String(username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const chat = findChatById(chatId);
+    if (!chat || (chat.type !== "group" && chat.type !== "channel")) {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+    if (!isMember(chatId, user.id)) {
+      return res.status(400).json({ error: "You are not a member of this group." });
+    }
+
+    const members = listChatMembers(chatId);
+    const isOwner = members.some(
+      (member) =>
+        Number(member.id) === Number(user.id) &&
+        String(member.role || "").toLowerCase() === "owner",
+    );
+    if (isOwner) {
+      const remainingMembers = members.filter(
+        (member) => Number(member.id) !== Number(user.id),
+      );
+      if (remainingMembers.length === 0) {
+        const { storedNames } = deleteChatById(chatId);
+        if (Array.isArray(storedNames) && storedNames.length > 0) {
+          removeStoredFileNames(storedNames);
+        }
+        return res.json({ ok: true, deleted: true });
+      }
+      const nextOwner =
+        remainingMembers[Math.floor(Math.random() * remainingMembers.length)];
+      if (nextOwner?.id) {
+        setChatMemberRole(chatId, Number(nextOwner.id), "owner");
+      }
+    }
+
+    removeChatMember(chatId, user.id);
+    markChatMemberLeft(chatId, user.id);
+    if (chat.type === "group") {
+      createMessage(chatId, user.id, `[[system:left:${user.nickname || user.username}]]`);
+      emitChatEvent(chatId, {
+        type: "chat_message",
+        chatId,
+        username: user.username,
+        body: `[[system:left:${user.nickname || user.username}]]`,
+      });
+    }
+    emitChatListChangedToChatParticipants(chatId, [user.username]);
+    return res.json({ ok: true });
+  });
+
+  app.post("/api/chats/group/:chatId/delete", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const chatId = Number(req.params?.chatId || 0);
+    const username = req.body?.username?.toString();
+    const password = req.body?.password?.toString();
+    if (!chatId || !username || !password) {
+      return res.status(400).json({
+        error: "Chat id, username, and password are required.",
+      });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(String(username || "").toLowerCase());
+    if (!user || !bcrypt.compareSync(String(password || ""), user.password_hash)) {
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    const chat = findChatById(chatId);
+    if (!chat || (chat.type !== "group" && chat.type !== "channel")) {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+
+    const members = listChatMembers(chatId);
+    const owner = members.find(
+      (member) =>
+        Number(member.id) === Number(user.id) &&
+        String(member.role || "").toLowerCase() === "owner",
+    );
+    if (!owner) {
+      return res
+        .status(403)
+        .json({ error: "Only the owner can delete this chat." });
+    }
+
+    const memberUsernames = members
+      .map((member) => String(member?.username || "").toLowerCase())
+      .filter(Boolean);
+
+    const { storedNames } = deleteChatById(chatId);
+    if (Array.isArray(storedNames) && storedNames.length > 0) {
+      removeStoredFileNames(storedNames);
+    }
+    memberUsernames.forEach((memberUsername) => {
+      try {
+        emitSseEvent(memberUsername, { type: "chat_list_changed", chatId });
+      } catch {
+        // ignore realtime list errors
+      }
+    });
+    return res.json({ ok: true, deleted: true });
+  });
+
+  app.post("/api/chats/group/:chatId/remove-member", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const chatId = Number(req.params?.chatId || 0);
+    const username = req.body?.username?.toString();
+    const targetUsername = req.body?.targetUsername?.toString();
+    if (!chatId || !username || !targetUsername) {
+      return res.status(400).json({
+        error: "Chat id, username, and targetUsername are required.",
+      });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const actor = findUserByUsername(String(username || "").toLowerCase());
+    const target = findUserByUsername(String(targetUsername || "").toLowerCase());
+    if (!actor || !target) {
+      return res.status(404).json({ error: "User not found." });
+    }
+    const chat = findChatById(chatId);
+    if (!chat || (chat.type !== "group" && chat.type !== "channel")) {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+
+    const members = listChatMembers(chatId);
+    const label = chat.type === "channel" ? "channel" : "group";
+    const actorMember = members.find((member) => Number(member.id) === Number(actor.id));
+    if (!actorMember || String(actorMember.role || "").toLowerCase() !== "owner") {
+      return res
+        .status(403)
+        .json({ error: `Only ${label} owner can remove members.` });
+    }
+    const targetMember = members.find((member) => Number(member.id) === Number(target.id));
+    if (!targetMember) {
+      return res.status(400).json({ error: "Target user is not a group member." });
+    }
+    if (String(targetMember.role || "").toLowerCase() === "owner") {
+      return res.status(400).json({ error: "Owner cannot be removed." });
+    }
+
+    removeChatMember(chatId, target.id);
+    markGroupMemberRemoved(chatId, target.id, actor.id);
+    if (chat.type === "group") {
+      createMessage(
+        chatId,
+        actor.id,
+        `[[system:removed:${target.nickname || target.username}]]`,
+      );
+      emitChatEvent(chatId, {
+        type: "chat_message",
+        chatId,
+        username: actor.username,
+        body: `[[system:removed:${target.nickname || target.username}]]`,
+      });
+    }
+    emitChatListChangedToChatParticipants(chatId, [target.username]);
+    return res.json({ ok: true });
+  });
+
+  app.post(
+    "/api/chats/group/:chatId/avatar",
+    uploadAvatar.single("avatar"),
+    (req, res) => {
+      const session = requireSession(req, res);
+      if (!session) {
+        removeUploadedFiles(req.file ? [req.file] : [], avatarUploadRootDir);
+        return;
+      }
+
+      const chatId = Number(req.params?.chatId || 0);
+      const username = req.body?.username?.toString();
+      const file = req.file;
+      if (!chatId || !username) {
+        removeUploadedFiles(file ? [file] : [], avatarUploadRootDir);
+        return res
+          .status(400)
+          .json({ error: "Group chat id and username are required." });
+      }
+      if (!requireSessionUsernameMatch(res, session, username)) {
+        removeUploadedFiles(file ? [file] : [], avatarUploadRootDir);
+        return;
+      }
+      if (!file) {
+        return res.status(400).json({ error: "Avatar file is required." });
+      }
+      const avatarMime = String(file.mimetype || "").toLowerCase();
+      if (!ALLOWED_AVATAR_MIME_TYPES.has(avatarMime)) {
+        removeUploadedFiles([file], avatarUploadRootDir);
+        return res
+          .status(400)
+          .json({ error: "Avatar must be a JPEG, PNG, GIF, WEBP, or BMP image." });
+      }
+
+      const chat = findChatById(chatId);
+      if (!chat || (chat.type !== "group" && chat.type !== "channel")) {
+        removeUploadedFiles([file], avatarUploadRootDir);
+        return res.status(404).json({ error: "Chat not found." });
+      }
+      const user = findUserByUsername(String(username || "").toLowerCase());
+      if (!user) {
+        removeUploadedFiles([file], avatarUploadRootDir);
+        return res.status(404).json({ error: "User not found." });
+      }
+      const members = listChatMembers(chatId);
+      const label = chat.type === "channel" ? "channel" : "group";
+      const isOwner = members.some(
+        (member) =>
+          Number(member.id) === Number(user.id) &&
+          String(member.role || "").toLowerCase() === "owner",
+      );
+      if (!isOwner) {
+        removeUploadedFiles([file], avatarUploadRootDir);
+        return res
+          .status(403)
+          .json({ error: `Only ${label} owner can update ${label} avatar.` });
+      }
+
+      const avatarUrl = `/api/uploads/avatars/${file.filename}`;
+      try {
+        storageEncryption.encryptFileInPlace(file.path);
+      } catch {
+        removeUploadedFiles([file], avatarUploadRootDir);
+        return res
+          .status(500)
+          .json({ error: "Unable to store avatar securely." });
+      }
+
+      if (String(chat.group_avatar_url || "").trim() && chat.group_avatar_url !== avatarUrl) {
+        removeAvatarByUrl(chat.group_avatar_url);
+      }
+
+      const updateFn = chat.type === "channel" ? updateChannelChat : updateGroupChat;
+      updateFn(chatId, {
+        name: chat.name,
+        groupUsername: chat.group_username,
+        groupVisibility: chat.group_visibility,
+        allowMemberInvites: Boolean(Number(chat.allow_member_invites || 0)),
+        groupAvatarUrl: avatarUrl,
+      });
+      emitChatListChangedToChatParticipants(chatId);
+
+      return res.json({
+        ok: true,
+        avatarUrl,
+        maxFileSizeBytes: AVATAR_FILE_LIMITS.maxFileSizeBytes,
+      });
+    },
+  );
+
+  app.delete("/api/chats/group/:chatId/avatar", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const chatId = Number(req.params?.chatId || 0);
+    const username = req.body?.username?.toString();
+    if (!chatId || !username) {
+      return res
+        .status(400)
+        .json({ error: "Group chat id and username are required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const chat = findChatById(chatId);
+    if (!chat || (chat.type !== "group" && chat.type !== "channel")) {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+    const user = findUserByUsername(String(username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+    const members = listChatMembers(chatId);
+    const label = chat.type === "channel" ? "channel" : "group";
+    const isOwner = members.some(
+      (member) =>
+        Number(member.id) === Number(user.id) &&
+        String(member.role || "").toLowerCase() === "owner",
+    );
+    if (!isOwner) {
+      return res
+        .status(403)
+        .json({ error: `Only ${label} owner can update ${label} avatar.` });
+    }
+
+    if (String(chat.group_avatar_url || "").trim()) {
+      removeAvatarByUrl(chat.group_avatar_url);
+    }
+    const updateFn = chat.type === "channel" ? updateChannelChat : updateGroupChat;
+    updateFn(chatId, {
+      name: chat.name,
+      groupUsername: chat.group_username,
+      groupVisibility: chat.group_visibility,
+      allowMemberInvites: Boolean(Number(chat.allow_member_invites || 0)),
+      groupAvatarUrl: null,
+    });
+    emitChatListChangedToChatParticipants(chatId);
+
+    return res.json({
+      ok: true,
+      avatarUrl: null,
+    });
+  });
+
+  app.put("/api/chats/:chatId/mute", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const chatId = Number(req.params?.chatId || 0);
+    const username = req.body?.username?.toString();
+    const muted = Boolean(req.body?.muted);
+    if (!chatId || !username) {
+      return res.status(400).json({ error: "Chat id and username are required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(String(username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const chat = findChatById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+    if (!isMember(chatId, user.id)) {
+      return res.status(403).json({ error: "Not a member of this chat." });
+    }
+
+    setChatMuted(user.id, chatId, muted);
+    return res.json({ ok: true, chatId, muted });
+  });
+
+  app.post("/api/chats/hide", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const { username, chatIds = [] } = req.body || {};
+    if (!username || !Array.isArray(chatIds) || !chatIds.length) {
+      return res
+        .status(400)
+        .json({ error: "Username and chatIds are required." });
+    }
+
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(username.toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    hideChatsForUser(user.id, chatIds.map((id) => Number(id)).filter(Boolean));
+
+    res.json({ ok: true });
+  });
+
+  app.post("/api/chats/group/:chatId/join-public", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const chatId = Number(req.params?.chatId || 0);
+    const username = req.body?.username?.toString();
+    if (!chatId || !username) {
+      return res.status(400).json({ error: "Group chat id and username are required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(String(username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const chat = findChatById(chatId);
+    if (!chat || (chat.type !== "group" && chat.type !== "channel")) {
+      return res.status(404).json({ error: "Chat not found." });
+    }
+    if (String(chat.group_visibility || "").toLowerCase() !== "public") {
+      return res.status(403).json({ error: "This group is private." });
+    }
+    if (isGroupMemberRemoved(chatId, user.id)) {
+      return res.status(403).json({
+        error: "You were removed from this group. Only the owner can re-add you.",
+      });
+    }
+
+    unhideChat(user.id, chatId);
+    const alreadyMember = isMember(chatId, user.id);
+    if (!alreadyMember) {
+      clearChatMemberLeft(chatId, user.id);
+      addChatMember(chatId, user.id, "member");
+      if (chat.type === "group") {
+        createMessage(chatId, user.id, `[[system:joined:${user.nickname || user.username}]]`);
+        emitChatEvent(chatId, {
+          type: "chat_message",
+          chatId,
+          username: user.username,
+          body: `[[system:joined:${user.nickname || user.username}]]`,
+        });
+      }
+    }
+    emitChatListChangedToChatParticipants(chatId);
+
+    return res.json({
+      ok: true,
+      id: chatId,
+      alreadyMember,
+    });
+  });
+
+  app.get("/api/users", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const exclude = req.query.exclude?.toString();
+    const query = req.query.query?.toString();
+    if (exclude && !requireSessionUsernameMatch(res, session, exclude)) return;
+
+    const users = query
+      ? searchUsers(query.toLowerCase(), exclude)
+      : listUsers(exclude);
+
+    res.json({
+      users: users.map((item) => ({
+        ...item,
+        avatar_url: ensureAvatarExists(item.id, item.avatar_url),
+      })),
+    });
+  });
+
+  app.post("/api/mentions/resolve", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const username = req.body?.username?.toString();
+    const mentions = Array.isArray(req.body?.mentions) ? req.body.mentions : [];
+    if (!username || !mentions.length) {
+      return res.status(400).json({ error: "Username and mentions are required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+    const requester = findUserByUsername(username.toLowerCase());
+    if (!requester) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const unique = Array.from(
+      new Set(
+        mentions
+          .map((item) => String(item || "").trim().toLowerCase())
+          .map((item) => item.replace(/^@+/, ""))
+          .filter((item) => item.length >= 3),
+      ),
+    ).slice(0, 50);
+
+    const results = [];
+    unique.forEach((mention) => {
+      const user = findUserByUsername(mention);
+      if (user) {
+        results.push({
+          kind: "user",
+          username: user.username,
+          nickname: user.nickname || user.username,
+          avatarUrl: ensureAvatarExists(user.id, user.avatar_url) || null,
+          color: user.color || "#10b981",
+        });
+        return;
+      }
+      const chat = findChatByGroupUsername(mention);
+      if (!chat) return;
+      const visibility = String(chat.group_visibility || "public").trim().toLowerCase();
+      const isMemberFlag = isMember(chat.id, requester.id);
+      if (visibility === "private" && !isMemberFlag) return;
+      const membersCount = listChatMembers(chat.id).length;
+      results.push({
+        kind: chat.type === "channel" ? "channel" : "group",
+        chatId: Number(chat.id),
+        username: chat.group_username || mention,
+        name: chat.name || (chat.type === "channel" ? "Channel" : "Group"),
+        avatarUrl: normalizeGroupAvatarUrl(chat.group_avatar_url),
+        color: chat.group_color || "#10b981",
+        visibility: chat.group_visibility || "public",
+        inviteToken: chat.invite_token || "",
+        membersCount,
+        isMember: Boolean(isMemberFlag),
+      });
+    });
+
+    return res.json({ mentions: results });
+  });
+
+  app.get("/api/discover", (req, res) => {
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const username = req.query.username?.toString();
+    const query = String(req.query.query || "").trim();
+    if (!username || !query) {
+      return res.status(400).json({ error: "Username and query are required." });
+    }
+    if (!requireSessionUsernameMatch(res, session, username)) return;
+
+    const user = findUserByUsername(String(username || "").toLowerCase());
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const users = searchUsers(query.toLowerCase(), username)
+      .map((item) => ({
+        ...item,
+        avatar_url: ensureAvatarExists(item.id, item.avatar_url),
+      }))
+      .slice(0, 20);
+
+    const groups = searchPublicGroups(query.toLowerCase(), user.id, 20).map((group) => ({
+      id: Number(group.id),
+      name: group.name || "Group",
+      username: group.group_username || "",
+      color: group.group_color || "#10b981",
+      avatarUrl: group.group_avatar_url || null,
+      inviteToken: group.invite_token || "",
+      membersCount: Number(group.members_count || 0),
+      isMember: Boolean(Number(group.is_member || 0)),
+      type: "group",
+    }));
+
+    const channels = searchPublicChannels(query.toLowerCase(), user.id, 20).map((channel) => ({
+      id: Number(channel.id),
+      name: channel.name || "Channel",
+      username: channel.group_username || "",
+      color: channel.group_color || "#10b981",
+      avatarUrl: channel.group_avatar_url || null,
+      inviteToken: channel.invite_token || "",
+      membersCount: Number(channel.members_count || 0),
+      isMember: Boolean(Number(channel.is_member || 0)),
+      type: "channel",
+    }));
+
+    return res.json({ users, groups, channels });
+  });
+}
+
+export { registerChatRoutes };

@@ -1,0 +1,29 @@
+﻿# Node
+node_modules/
+
+# Client build
+client/dist/
+
+# Server build / data
+server/node_modules/
+data/
+*.sqlite
+
+# Vite cache
+.vite/
+
+# Env
+.env
+.env.local
+
+# Logs
+logs/
+
+# OS/editor
+.DS_Store
+.todo
+.vscode/
+.idea/
+
+# TLS certs
+certs/
